@@ -102,17 +102,23 @@ describe("vault-core", () => {
   describe("initialize_vault", () => {
     it("Initializes a vault successfully", async () => {
       const [vault] = await getVaultPDA(tokenMint1);
+      const [vaultAuthority] = await getVaultAuthorityPDA(tokenMint1);
+
+      // Use same mint for rewards (as user confirmed this is fine)
+      const rewardMint = tokenMint1;
+      const rewardVault = await getAssociatedTokenAddress(
+        rewardMint,
+        vaultAuthority,
+        true
+      );
 
       await program.methods
         .initializeVault()
         .accounts({
-          //vault: vault,
           authority: authority.publicKey,
           tokenMint: tokenMint1,
-          //vaultTokenAccount: vaultTokenAccount,
-          //vaultAuthority: vaultAuthority,
-          //tokenProgram: TOKEN_PROGRAM_ID,
-          //systemProgram: SystemProgram.programId,
+          rewardMint: rewardMint,
+          //rewardVault: rewardVault,
         })
         .signers([authority])
         .rpc();
@@ -123,29 +129,47 @@ describe("vault-core", () => {
       );
       expect(vaultAccount.tokenMint.toString()).to.equal(tokenMint1.toString());
       expect(vaultAccount.totalShares.toNumber()).to.equal(0);
+      expect(vaultAccount.rewardRate.toNumber()).to.equal(0);
+      expect(vaultAccount.accRewardPerShare.toString()).to.equal("0");
     });
 
     it("Allows multiple vaults for different token mints", async () => {
       // Initialize vault for tokenMint1
       const [vault1] = await getVaultPDA(tokenMint1);
+      const [vaultAuthority1] = await getVaultAuthorityPDA(tokenMint1);
+      const rewardVault1 = await getAssociatedTokenAddress(
+        tokenMint1,
+        vaultAuthority1,
+        true
+      );
 
       await program.methods
         .initializeVault()
         .accounts({
           authority: authority.publicKey,
           tokenMint: tokenMint1,
+          rewardMint: tokenMint1,
+          //rewardVault: rewardVault1,
         })
         .signers([authority])
         .rpc();
 
       // Initialize vault for tokenMint2
       const [vault2] = await getVaultPDA(tokenMint2);
+      const [vaultAuthority2] = await getVaultAuthorityPDA(tokenMint2);
+      const rewardVault2 = await getAssociatedTokenAddress(
+        tokenMint2,
+        vaultAuthority2,
+        true
+      );
 
       await program.methods
         .initializeVault()
         .accounts({
           authority: authority.publicKey,
           tokenMint: tokenMint2,
+          rewardMint: tokenMint2,
+          //rewardVault: rewardVault2,
         })
         .signers([authority])
         .rpc();
@@ -182,11 +206,19 @@ describe("vault-core", () => {
       );
       vaultTokenAccount = vaultTokenAccountInfo.address;
 
+      const rewardVault = await getAssociatedTokenAddress(
+        tokenMint1,
+        vaultAuthority,
+        true
+      );
+
       await program.methods
         .initializeVault()
         .accounts({
           authority: authority.publicKey,
           tokenMint: tokenMint1,
+          rewardMint: tokenMint1,
+          //rewardVault: rewardVault,
         })
         .signers([authority])
         .rpc();
@@ -213,10 +245,7 @@ describe("vault-core", () => {
     it("Deposits tokens and mints shares (first deposit)", async () => {
       const depositAmount = new anchor.BN(1000 * 10 ** 9); // 1000 tokens
 
-      const [userPosition] = await getUserPositionPDA(
-        vault,
-        user1.publicKey
-      );
+      const [userPosition] = await getUserPositionPDA(vault, user1.publicKey);
 
       await program.methods
         .deposit(depositAmount)
@@ -256,10 +285,7 @@ describe("vault-core", () => {
       const firstDeposit = new anchor.BN(1000 * 10 ** 9);
       const secondDeposit = new anchor.BN(500 * 10 ** 9);
 
-      const [userPosition] = await getUserPositionPDA(
-        vault,
-        user1.publicKey
-      );
+      const [userPosition] = await getUserPositionPDA(vault, user1.publicKey);
 
       // First deposit
       await program.methods
@@ -305,10 +331,7 @@ describe("vault-core", () => {
 
     it("Handles tiny deposit (1 token) when vault is empty", async () => {
       const tinyDeposit = new anchor.BN(1);
-      const [userPosition] = await getUserPositionPDA(
-        vault,
-        user1.publicKey
-      );
+      const [userPosition] = await getUserPositionPDA(vault, user1.publicKey);
 
       await program.methods
         .deposit(tinyDeposit)
@@ -415,14 +438,8 @@ describe("vault-core", () => {
         1000000 * 10 ** 9
       );
 
-      const [user1Position] = await getUserPositionPDA(
-        vault,
-        user1.publicKey
-      );
-      const [user2Position] = await getUserPositionPDA(
-        vault,
-        user2.publicKey
-      );
+      const [user1Position] = await getUserPositionPDA(vault, user1.publicKey);
+      const [user2Position] = await getUserPositionPDA(vault, user2.publicKey);
 
       // User1 deposits
       await program.methods
@@ -519,16 +536,19 @@ describe("vault-core", () => {
       );
       vaultTokenAccount = vaultTokenAccountInfo.address;
 
+      const rewardVault = await getAssociatedTokenAddress(
+        tokenMint1,
+        vaultAuthority,
+        true
+      );
+
       await program.methods
         .initializeVault()
         .accounts({
-          //vault: vault,
           authority: authority.publicKey,
           tokenMint: tokenMint1,
-          //vaultTokenAccount: vaultTokenAccount,
-          //vaultAuthority: vaultAuthority,
-          //tokenProgram: TOKEN_PROGRAM_ID,
-          //systemProgram: SystemProgram.programId,
+          rewardMint: tokenMint1,
+          //rewardVault: rewardVault,
         })
         .signers([authority])
         .rpc();
@@ -700,8 +720,8 @@ describe("vault-core", () => {
   describe("invariants", () => {
     it("Maintains invariant: total_shares >= sum(user_shares) with multiple users", async () => {
       // Initialize vault
-      const [vault,] = await getVaultPDA(tokenMint1);
-      const [vaultAuthority,] = await getVaultAuthorityPDA(tokenMint1);
+      const [vault] = await getVaultPDA(tokenMint1);
+      const [vaultAuthority] = await getVaultAuthorityPDA(tokenMint1);
       const vaultTokenAccountInfo = await getOrCreateAssociatedTokenAccount(
         connection,
         authority,
@@ -711,11 +731,19 @@ describe("vault-core", () => {
       );
       const vaultTokenAccount = vaultTokenAccountInfo.address;
 
+      const rewardVault = await getAssociatedTokenAddress(
+        tokenMint1,
+        vaultAuthority,
+        true
+      );
+
       await program.methods
         .initializeVault()
         .accounts({
           authority: authority.publicKey,
           tokenMint: tokenMint1,
+          rewardMint: tokenMint1,
+          //rewardVault: rewardVault,
         })
         .signers([authority])
         .rpc();
@@ -756,14 +784,8 @@ describe("vault-core", () => {
         ),
       ]);
 
-      const [user1Position] = await getUserPositionPDA(
-        vault,
-        user1.publicKey
-      );
-      const [user2Position] = await getUserPositionPDA(
-        vault,
-        user2.publicKey
-      );
+      const [user1Position] = await getUserPositionPDA(vault, user1.publicKey);
+      const [user2Position] = await getUserPositionPDA(vault, user2.publicKey);
 
       // Multiple deposits and withdrawals
       await program.methods
@@ -804,6 +826,470 @@ describe("vault-core", () => {
         totalUserShares
       );
       expect(vaultAccount.totalShares.toNumber()).to.equal(totalUserShares);
+    });
+  });
+
+  describe.only("rewards", () => {
+    let vault: PublicKey;
+    let vaultAuthority: PublicKey;
+    let vaultTokenAccount: PublicKey;
+    let rewardVault: PublicKey;
+    let rewardMint: PublicKey;
+    let user1TokenAccount: PublicKey;
+    let user2TokenAccount: PublicKey;
+    let user1RewardAccount: PublicKey;
+
+    beforeEach(async () => {
+      // Create reward mint (can be same as staked token)
+      rewardMint = await createMint(
+        connection,
+        authority,
+        authority.publicKey,
+        null,
+        9
+      );
+
+      // Initialize vault
+      const [vaultPDA] = await getVaultPDA(tokenMint1);
+      vault = vaultPDA;
+      const [vaultAuthorityPDA] = await getVaultAuthorityPDA(tokenMint1);
+      vaultAuthority = vaultAuthorityPDA;
+
+      const vaultTokenAccountInfo = await getOrCreateAssociatedTokenAccount(
+        connection,
+        authority,
+        tokenMint1,
+        vaultAuthority,
+        true
+      );
+      vaultTokenAccount = vaultTokenAccountInfo.address;
+
+      const rewardVaultInfo = await getOrCreateAssociatedTokenAccount(
+        connection,
+        authority,
+        rewardMint,
+        vaultAuthority,
+        true
+      );
+      rewardVault = rewardVaultInfo.address;
+
+      await program.methods
+        .initializeVault()
+        .accounts({
+          authority: authority.publicKey,
+          tokenMint: tokenMint1,
+          rewardMint: rewardMint,
+          //rewardVault: rewardVault,
+        })
+        .signers([authority])
+        .rpc();
+
+      // Create user token accounts and mint tokens
+      const user1TokenAccountInfo = await getOrCreateAssociatedTokenAccount(
+        connection,
+        user1,
+        tokenMint1,
+        user1.publicKey,
+        false
+      );
+      user1TokenAccount = user1TokenAccountInfo.address;
+
+      const user2TokenAccountInfo = await getOrCreateAssociatedTokenAccount(
+        connection,
+        user2,
+        tokenMint1,
+        user2.publicKey,
+        false
+      );
+      user2TokenAccount = user2TokenAccountInfo.address;
+
+      await Promise.all([
+        mintTo(
+          connection,
+          authority,
+          tokenMint1,
+          user1TokenAccount,
+          authority,
+          1000000 * 10 ** 9
+        ),
+        mintTo(
+          connection,
+          authority,
+          tokenMint1,
+          user2TokenAccount,
+          authority,
+          1000000 * 10 ** 9
+        ),
+      ]);
+
+      // Create user reward token account
+      const user1RewardAccountInfo = await getOrCreateAssociatedTokenAccount(
+        connection,
+        user1,
+        rewardMint,
+        user1.publicKey,
+        false
+      );
+      user1RewardAccount = user1RewardAccountInfo.address;
+    });
+
+    it("Funds rewards and sets reward rate", async () => {
+      // Fund reward vault with tokens
+      const fundAmount = 1000000 * 10 ** 9; // 1M tokens
+      const rewardRate = 1000 * 10 ** 9; // 1000 tokens per second
+
+      // Create funder token account and mint tokens
+      const funderRewardAccount = await getOrCreateAssociatedTokenAccount(
+        connection,
+        authority,
+        rewardMint,
+        authority.publicKey,
+        false
+      );
+      await mintTo(
+        connection,
+        authority,
+        rewardMint,
+        funderRewardAccount.address,
+        authority,
+        fundAmount
+      );
+
+      await program.methods
+        .fundRewards(new anchor.BN(fundAmount), new anchor.BN(rewardRate))
+        .accounts({
+          vault: vault,
+          funder: authority.publicKey,
+          funderTokenAccount: funderRewardAccount.address,
+          rewardVault: rewardVault,
+        })
+        .signers([authority])
+        .rpc();
+
+      const vaultAccount = await program.account.vault.fetch(vault);
+      expect(vaultAccount.rewardRate.toNumber()).to.equal(rewardRate);
+
+      const rewardVaultBalance = await getAccount(connection, rewardVault);
+      expect(rewardVaultBalance.amount.toString()).to.equal(
+        fundAmount.toString()
+      );
+    });
+
+    it("Distributes rewards to multiple users proportionally", async () => {
+      // Fund rewards
+      const fundAmount = 1000000 * 10 ** 9;
+      const rewardRate = 100 * 10 ** 9; // 100 tokens per second
+
+      const funderRewardAccount = await getOrCreateAssociatedTokenAccount(
+        connection,
+        authority,
+        rewardMint,
+        authority.publicKey,
+        false
+      );
+      await mintTo(
+        connection,
+        authority,
+        rewardMint,
+        funderRewardAccount.address,
+        authority,
+        fundAmount
+      );
+
+      await program.methods
+        .fundRewards(new anchor.BN(fundAmount), new anchor.BN(rewardRate))
+        .accounts({
+          vault: vault,
+          funder: authority.publicKey,
+          funderTokenAccount: funderRewardAccount.address,
+          rewardVault: rewardVault,
+        })
+        .signers([authority])
+        .rpc();
+
+      // User1 deposits 1000 tokens
+      const deposit1 = new anchor.BN(1000 * 10 ** 9);
+      await program.methods
+        .deposit(deposit1)
+        .accounts({
+          vault: vault,
+          user: user1.publicKey,
+          userTokenAccount: user1TokenAccount,
+          vaultTokenAccount: vaultTokenAccount,
+        })
+        .signers([user1])
+        .rpc();
+
+      // Wait a bit (simulate time passing)
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+
+      // User2 deposits 2000 tokens
+      const deposit2 = new anchor.BN(2000 * 10 ** 9);
+      await program.methods
+        .deposit(deposit2)
+        .accounts({
+          vault: vault,
+          user: user2.publicKey,
+          userTokenAccount: user2TokenAccount,
+          vaultTokenAccount: vaultTokenAccount,
+        })
+        .signers([user2])
+        .rpc();
+
+      // Wait more time
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+
+      const user2RewardAccount = await getOrCreateAssociatedTokenAccount(
+        connection,
+        user2,
+        rewardMint,
+        user2.publicKey,
+        false
+      );
+
+      // User1 claims rewards
+      await program.methods
+        .claimRewards()
+        .accountsPartial({
+          vault: vault,
+          user: user1.publicKey,
+          userRewardTokenAccount: user1RewardAccount,
+          rewardVault: rewardVault,
+        })
+        .postInstructions([
+          await program.methods
+            .claimRewards()
+            .accountsPartial({
+              vault,
+              user: user2.publicKey,
+              userRewardTokenAccount: user2RewardAccount.address,
+              rewardVault,
+            })
+            .instruction(),
+        ])
+        .signers([user1, user2])
+        .rpc();
+
+      // User1 should have received more rewards (was in longer and had earlier deposit)
+      const user1RewardBalance = await getAccount(
+        connection,
+        user1RewardAccount
+      );
+
+      const user2RewardBalance = await getAccount(
+        connection,
+        user2RewardAccount.address
+      );
+      expect(Number(user1RewardBalance.amount)).to.be.greaterThan(0);
+      expect(Number(user2RewardBalance.amount)).to.be.greaterThan(0);
+      expect(Number(user1RewardBalance.amount)).to.be.greaterThan(
+        Number(user2RewardBalance.amount)
+      );
+    });
+
+    it("Handles zero reward rate correctly", async () => {
+      // Deposit without funding rewards (reward_rate = 0)
+      const deposit = new anchor.BN(1000 * 10 ** 9);
+      await program.methods
+        .deposit(deposit)
+        .accounts({
+          vault: vault,
+          user: user1.publicKey,
+          userTokenAccount: user1TokenAccount,
+          vaultTokenAccount: vaultTokenAccount,
+        })
+        .signers([user1])
+        .rpc();
+
+      // Wait some time
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      // Claim should succeed but yield zero rewards
+      await program.methods
+        .claimRewards()
+        .accountsPartial({
+          vault: vault,
+          user: user1.publicKey,
+          userRewardTokenAccount: user1RewardAccount,
+          rewardVault: rewardVault,
+        })
+        .signers([user1])
+        .rpc();
+
+      const user1RewardBalance = await getAccount(
+        connection,
+        user1RewardAccount
+      );
+      expect(Number(user1RewardBalance.amount)).to.equal(0);
+    });
+
+    it("Settles rewards on deposit and withdraw", async () => {
+      // Fund rewards
+      const fundAmount = 1000000 * 10 ** 9;
+      const rewardRate = 100 * 10 ** 9;
+
+      const funderRewardAccount = await getOrCreateAssociatedTokenAccount(
+        connection,
+        authority,
+        rewardMint,
+        authority.publicKey,
+        false
+      );
+      await mintTo(
+        connection,
+        authority,
+        rewardMint,
+        funderRewardAccount.address,
+        authority,
+        fundAmount
+      );
+
+      await program.methods
+        .fundRewards(new anchor.BN(fundAmount), new anchor.BN(rewardRate))
+        .accounts({
+          vault: vault,
+          funder: authority.publicKey,
+          funderTokenAccount: funderRewardAccount.address,
+          rewardVault: rewardVault,
+        })
+        .signers([authority])
+        .rpc();
+
+      // Initial deposit
+      await program.methods
+        .deposit(new anchor.BN(1000 * 10 ** 9))
+        .accounts({
+          vault: vault,
+          user: user1.publicKey,
+          userTokenAccount: user1TokenAccount,
+          vaultTokenAccount: vaultTokenAccount,
+        })
+        .signers([user1])
+        .rpc();
+
+      // Wait for rewards to accrue
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      // Additional deposit should settle existing rewards
+      await program.methods
+        .deposit(new anchor.BN(500 * 10 ** 9))
+        .accounts({
+          vault: vault,
+          user: user1.publicKey,
+          userTokenAccount: user1TokenAccount,
+          vaultTokenAccount: vaultTokenAccount,
+        })
+        .signers([user1])
+        .rpc();
+
+      // Withdraw should also settle rewards
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      await program.methods
+        .withdraw(new anchor.BN(500 * 10 ** 9))
+        .accountsPartial({
+          vault,
+          user: user1.publicKey,
+          userTokenAccount: user1TokenAccount,
+          vaultTokenAccount,
+        })
+        .signers([user1])
+        .rpc();
+
+      // Claim remaining rewards
+      await program.methods
+        .claimRewards()
+        .accountsPartial({
+          vault: vault,
+          user: user1.publicKey,
+          userRewardTokenAccount: user1RewardAccount,
+          rewardVault: rewardVault,
+        })
+        .signers([user1])
+        .rpc();
+
+      const user1RewardBalance = await getAccount(connection, user1RewardAccount);
+      expect(Number(user1RewardBalance.amount)).to.be.greaterThan(0);
+    });
+
+    it("Handles full withdrawal with rewards", async () => {
+      // Fund rewards
+      const fundAmount = 1000000 * 10 ** 9;
+      const rewardRate = 100 * 10 ** 9;
+
+      const funderRewardAccount = await getOrCreateAssociatedTokenAccount(
+        connection,
+        authority,
+        rewardMint,
+        authority.publicKey,
+        false
+      );
+      await mintTo(
+        connection,
+        authority,
+        rewardMint,
+        funderRewardAccount.address,
+        authority,
+        fundAmount
+      );
+
+      await program.methods
+        .fundRewards(new anchor.BN(fundAmount), new anchor.BN(rewardRate))
+        .accounts({
+          vault: vault,
+          funder: authority.publicKey,
+          funderTokenAccount: funderRewardAccount.address,
+          rewardVault: rewardVault,
+        })
+        .signers([authority])
+        .rpc();
+
+      // Deposit
+      const deposit = new anchor.BN(1000 * 10 ** 9);
+      await program.methods
+        .deposit(deposit)
+        .accounts({
+          vault: vault,
+          user: user1.publicKey,
+          userTokenAccount: user1TokenAccount,
+          vaultTokenAccount: vaultTokenAccount,
+        })
+        .signers([user1])
+        .rpc();
+
+      // Wait for rewards
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      // Full withdrawal should settle rewards before closing
+      const vaultAccount = await program.account.vault.fetch(vault);
+      await program.methods
+        .withdraw(vaultAccount.totalShares)
+        .accountsPartial({
+          vault,
+          user: user1.publicKey,
+          userTokenAccount: user1TokenAccount,
+          vaultTokenAccount,
+        })
+        .signers([user1])
+        .rpc();
+
+      // Claim rewards
+      await program.methods
+        .claimRewards()
+        .accountsPartial({
+          vault: vault,
+          user: user1.publicKey,
+          userRewardTokenAccount: user1RewardAccount,
+          rewardVault: rewardVault,
+        })
+        .signers([user1])
+        .rpc();
+
+      const user1RewardBalance = await getAccount(
+        connection,
+        user1RewardAccount
+      );
+      expect(Number(user1RewardBalance.amount)).to.be.greaterThan(0);
     });
   });
 });
