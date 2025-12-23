@@ -1,0 +1,509 @@
+import * as anchor from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import { ComposerRouter } from "../target/types/composer_router";
+import { MockAmm } from "../target/types/mock_amm";
+import { VaultCore } from "../target/types/vault_core";
+import {
+  TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddress,
+  getOrCreateAssociatedTokenAccount,
+  createMint,
+  mintTo,
+  getAccount,
+} from "@solana/spl-token";
+import { expect } from "chai";
+import {
+  PublicKey,
+  Keypair,
+  SystemProgram,
+} from "@solana/web3.js";
+
+describe("composer-router", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const routerProgram = anchor.workspace
+    .composerRouter as Program<ComposerRouter>;
+  const ammProgram = anchor.workspace.mockAmm as Program<MockAmm>;
+  const vaultProgram = anchor.workspace.vaultCore as Program<VaultCore>;
+  const connection = provider.connection;
+
+  let authority: Keypair;
+  let user: Keypair;
+  let tokenMintA: PublicKey;
+  let tokenMintB: PublicKey;
+
+  beforeEach(async () => {
+    authority = Keypair.generate();
+    user = Keypair.generate();
+
+    const airdropAmount = 10 * anchor.web3.LAMPORTS_PER_SOL;
+    const airdropTxs = await Promise.all([
+      connection.requestAirdrop(authority.publicKey, airdropAmount),
+      connection.requestAirdrop(user.publicKey, airdropAmount),
+    ]);
+
+    const blockhash = await connection.getLatestBlockhash();
+    await Promise.all(
+      airdropTxs.map((signature) => {
+        return connection.confirmTransaction(
+          { signature, ...blockhash },
+          "confirmed"
+        );
+      })
+    );
+
+    tokenMintA = await createMint(
+      connection,
+      authority,
+      authority.publicKey,
+      null,
+      9
+    );
+    tokenMintB = await createMint(
+      connection,
+      authority,
+      authority.publicKey,
+      null,
+      9
+    );
+  });
+
+  async function getRouterConfigPDA(): Promise<[PublicKey, number]> {
+    return PublicKey.findProgramAddressSync(
+      [Buffer.from("router_config")],
+      routerProgram.programId
+    );
+  }
+
+  async function getPoolPDA(
+    mintA: PublicKey,
+    mintB: PublicKey
+  ): Promise<[PublicKey, number]> {
+    // Ensure deterministic ordering (smaller mint first)
+    const [mint1, mint2] =
+      mintA.toBuffer().toString("hex") < mintB.toBuffer().toString("hex")
+        ? [mintA, mintB]
+        : [mintB, mintA];
+    return PublicKey.findProgramAddressSync(
+      [Buffer.from("pool"), mint1.toBuffer(), mint2.toBuffer()],
+      ammProgram.programId
+    );
+  }
+
+  async function getPoolAuthorityPDA(
+    mintA: PublicKey,
+    mintB: PublicKey
+  ): Promise<[PublicKey, number]> {
+    const [mint1, mint2] =
+      mintA.toBuffer().toString("hex") < mintB.toBuffer().toString("hex")
+        ? [mintA, mintB]
+        : [mintB, mintA];
+    return PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("pool"),
+        mint1.toBuffer(),
+        mint2.toBuffer(),
+        Buffer.from("authority"),
+      ],
+      ammProgram.programId
+    );
+  }
+
+  describe("deposit_swap_stake", () => {
+    let routerConfig: PublicKey;
+    let pool: PublicKey;
+    let poolAuthority: PublicKey;
+    let vault: PublicKey;
+    let vaultAuthority: PublicKey;
+    let userTokenAccountA: PublicKey;
+    let userTokenAccountB: PublicKey;
+    let vaultTokenAccount: PublicKey;
+    let poolVaultA: PublicKey;
+    let poolVaultB: PublicKey;
+
+    beforeEach(async () => {
+      [tokenMintA, tokenMintB] =
+        tokenMintA.toBuffer().toString("hex") <
+        tokenMintB.toBuffer().toString("hex")
+          ? [tokenMintA, tokenMintB]
+          : [tokenMintB, tokenMintA];
+
+      // Initialize AMM pool
+      const [poolPDA, bumpPool] = await getPoolPDA(tokenMintA, tokenMintB);
+      console.log("poolPDA: ", poolPDA.toString());
+      console.log("bumpPool: ", bumpPool);
+      pool = poolPDA;
+      const [poolAuthorityPDA, bumpAuth] = await getPoolAuthorityPDA(
+        tokenMintA,
+        tokenMintB
+      );
+      console.log("poolAuthorityPDA: ", poolAuthorityPDA.toString());
+      console.log("bumpAuth: ", bumpAuth);
+      poolAuthority = poolAuthorityPDA;
+
+      // Create pool vaults - ensure they're created with pool_authority as owner
+      const poolVaultAInfo = await getOrCreateAssociatedTokenAccount(
+        connection,
+        authority,
+        tokenMintA,
+        poolAuthority,
+        true
+      );
+      poolVaultA = poolVaultAInfo.address;
+
+      const poolVaultBInfo = await getOrCreateAssociatedTokenAccount(
+        connection,
+        authority,
+        tokenMintB,
+        poolAuthority,
+        true
+      );
+      poolVaultB = poolVaultBInfo.address;
+
+      // Verify vaults have correct owner (pool_authority)
+      const vaultAAccount = await getAccount(connection, poolVaultA);
+      const vaultBAccount = await getAccount(connection, poolVaultB);
+      if (vaultAAccount.owner.toString() !== poolAuthority.toString()) {
+        throw new Error(
+          `Pool vault A has wrong owner. Expected ${poolAuthority.toString()}, got ${vaultAAccount.owner.toString()}`
+        );
+      }
+      if (vaultBAccount.owner.toString() !== poolAuthority.toString()) {
+        throw new Error(
+          `Pool vault B has wrong owner. Expected ${poolAuthority.toString()}, got ${vaultBAccount.owner.toString()}`
+        );
+      }
+
+      // Create authority token accounts for initial liquidity
+      const authorityTokenAccountA = await getOrCreateAssociatedTokenAccount(
+        connection,
+        authority,
+        tokenMintA,
+        authority.publicKey,
+        false
+      );
+      const authorityTokenAccountB = await getOrCreateAssociatedTokenAccount(
+        connection,
+        authority,
+        tokenMintB,
+        authority.publicKey,
+        false
+      );
+
+      await mintTo(
+        connection,
+        authority,
+        tokenMintA,
+        authorityTokenAccountA.address,
+        authority,
+        1000000 * 10 ** 9,
+        undefined
+      );
+      await mintTo(
+        connection,
+        authority,
+        tokenMintB,
+        authorityTokenAccountB.address,
+        authority,
+        1000000 * 10 ** 9,
+        undefined
+      );
+
+      // Initialize pool
+      // Note: Since mints are unique per test, the pool should always be unique
+      // If initialization fails because pool exists, that's a test isolation issue
+      try {
+        await ammProgram.methods
+          .initializePool(
+            new anchor.BN(100000 * 10 ** 9),
+            new anchor.BN(100000 * 10 ** 9)
+          )
+          .accounts({
+            authority: authority.publicKey,
+            mintA: tokenMintA,
+            mintB: tokenMintB,
+            vaultA: poolVaultA,
+            vaultB: poolVaultB,
+            authorityTokenAccountA: authorityTokenAccountA.address,
+            authorityTokenAccountB: authorityTokenAccountB.address,
+          })
+          .signers([authority])
+          .rpc();
+      } catch (e: any) {
+        // If pool already exists, that's unexpected but we can continue
+        // This might happen if tests aren't properly isolated
+        console.log("happening here");
+        if (!e.toString().includes("already in use")) {
+          throw e;
+        }
+      }
+
+      // Initialize vault for token B
+      const [vaultPDA] = PublicKey.findProgramAddressSync(
+        [Buffer.from("vault"), tokenMintB.toBuffer()],
+        vaultProgram.programId
+      );
+      vault = vaultPDA;
+      const [vaultAuthorityPDA] = PublicKey.findProgramAddressSync(
+        [Buffer.from("vault"), tokenMintB.toBuffer(), Buffer.from("authority")],
+        vaultProgram.programId
+      );
+      vaultAuthority = vaultAuthorityPDA;
+
+      vaultTokenAccount = await getAssociatedTokenAddress(
+        tokenMintB,
+        vaultAuthority,
+        true
+      );
+
+      // Initialize vault
+      // Note: Since mints are unique per test, the vault should always be unique
+      // If initialization fails because vault exists, that's a test isolation issue
+      try {
+        await vaultProgram.methods
+          .initializeVault()
+          .accounts({
+            authority: authority.publicKey,
+            tokenMint: tokenMintB,
+            rewardMint: tokenMintB,
+          })
+          .signers([authority])
+          .rpc();
+      } catch (e: any) {
+        // If vault already exists, that's unexpected but we can continue
+        // This might happen if tests aren't properly isolated
+        if (!e.toString().includes("already in use")) {
+          throw e;
+        }
+      }
+
+      // Create user token accounts
+      const userTokenAccountAInfo = await getOrCreateAssociatedTokenAccount(
+        connection,
+        user,
+        tokenMintA,
+        user.publicKey,
+        false
+      );
+      userTokenAccountA = userTokenAccountAInfo.address;
+
+      const userTokenAccountBInfo = await getOrCreateAssociatedTokenAccount(
+        connection,
+        user,
+        tokenMintB,
+        user.publicKey,
+        false
+      );
+      userTokenAccountB = userTokenAccountBInfo.address;
+
+      // Mint tokens to user
+      await mintTo(
+        connection,
+        authority,
+        tokenMintA,
+        userTokenAccountA,
+        authority,
+        10000 * 10 ** 9,
+        undefined
+      );
+    });
+
+    it("Happy path: Deposit → Swap → Stake succeeds", async () => {
+      const swapAmountIn = new anchor.BN(1000 * 10 ** 9);
+      const minAmountOut = new anchor.BN(900 * 10 ** 9); // Allow some slippage
+      const vaultDepositAmount = new anchor.BN(950 * 10 ** 9); // Approximate swap output
+
+      // Get user position PDA
+      const [userPosition] = PublicKey.findProgramAddressSync(
+        [Buffer.from("position"), vault.toBuffer(), user.publicKey.toBuffer()],
+        vaultProgram.programId
+      );
+
+      const initialBalanceA = (await getAccount(connection, userTokenAccountA))
+        .amount;
+      const initialBalanceB = (await getAccount(connection, userTokenAccountB))
+        .amount;
+
+      // Build remaining accounts for swap CPI
+      // mock-amm swap accounts: pool, user, user_token_in, user_token_out, vault_a, vault_b, pool_authority, token_program
+      const swapAccounts = [
+        { pubkey: pool, isSigner: false, isWritable: false },
+        { pubkey: user.publicKey, isSigner: true, isWritable: false },
+        { pubkey: userTokenAccountA, isSigner: false, isWritable: true },
+        { pubkey: userTokenAccountB, isSigner: false, isWritable: true },
+        { pubkey: poolVaultA, isSigner: false, isWritable: true },
+        { pubkey: poolVaultB, isSigner: false, isWritable: true },
+        { pubkey: poolAuthority, isSigner: false, isWritable: false },
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      ];
+
+      // Build remaining accounts for vault deposit CPI
+      // vault deposit accounts: vault, user_position, user, user_token_account, vault_token_account, vault_authority, token_program, system_program
+      const vaultAccounts = [
+        { pubkey: vault, isSigner: false, isWritable: true },
+        { pubkey: userPosition, isSigner: false, isWritable: true },
+        { pubkey: user.publicKey, isSigner: true, isWritable: false },
+        { pubkey: userTokenAccountB, isSigner: false, isWritable: true },
+        { pubkey: vaultTokenAccount, isSigner: false, isWritable: true },
+        { pubkey: vaultAuthority, isSigner: false, isWritable: false },
+        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ];
+
+      const remainingAccounts = [...swapAccounts, ...vaultAccounts];
+      remainingAccounts.forEach((account, index) =>
+        console.log(`${index}: ${account.pubkey.toString()}`)
+      );
+      console.log("tokenMintA: ", tokenMintA.toString());
+      console.log("tokenMintB: ", tokenMintB.toString());
+
+      try {
+        const tx = await routerProgram.methods
+          .depositSwapStake(
+            swapAmountIn,
+            minAmountOut,
+            vaultDepositAmount,
+            tokenMintA,
+            tokenMintB
+          )
+          .accounts({
+            user: user.publicKey,
+            inputTokenAccount: userTokenAccountA,
+            outputTokenAccount: userTokenAccountB,
+            vaultProgram: vaultProgram.programId,
+          })
+          .remainingAccounts(remainingAccounts)
+          .signers([user])
+          .rpc({ skipPreflight: true });
+        console.log("tx: ", tx);
+      } catch (e: any) {
+        console.log("error: ", e);
+        //console.log(await e.getLogs());
+      }
+
+      // Verify tokens were swapped and deposited
+      const finalBalanceA = (await getAccount(connection, userTokenAccountA))
+        .amount;
+      const finalBalanceB = (await getAccount(connection, userTokenAccountB))
+        .amount;
+
+      expect(Number(finalBalanceA)).to.be.lessThan(Number(initialBalanceA));
+      expect(Number(finalBalanceB)).to.be.greaterThan(Number(initialBalanceB));
+
+      // Verify vault has tokens
+      const vaultBalance = (await getAccount(connection, vaultTokenAccount))
+        .amount;
+      expect(Number(vaultBalance)).to.be.greaterThan(0);
+
+      // Verify user position was created
+      const position = await vaultProgram.account.userPosition.fetch(
+        userPosition
+      );
+      expect(position.shares.toNumber()).to.be.greaterThan(0);
+    });
+
+    it("Fails with wrong mint", async () => {
+      const swapAmountIn = new anchor.BN(1000 * 10 ** 9);
+      const minAmountOut = new anchor.BN(900 * 10 ** 9);
+      const vaultDepositAmount = new anchor.BN(950 * 10 ** 9);
+
+      // Use wrong mint for expected_input_mint
+      const wrongMint = await createMint(
+        connection,
+        authority,
+        authority.publicKey,
+        null,
+        9
+      );
+
+      try {
+        await routerProgram.methods
+          .depositSwapStake(
+            swapAmountIn,
+            minAmountOut,
+            vaultDepositAmount,
+            wrongMint, // Wrong mint
+            tokenMintB
+          )
+          .accounts({
+            user: user.publicKey,
+            inputTokenAccount: userTokenAccountA,
+            outputTokenAccount: userTokenAccountB,
+            vaultProgram: vaultProgram.programId,
+          })
+          .signers([user])
+          .rpc();
+        expect.fail("Should have failed with wrong mint");
+      } catch (e) {
+        expect(e.toString()).to.include("InvalidMint");
+      }
+    });
+
+    it("Fails with insufficient balance", async () => {
+      const swapAmountIn = new anchor.BN(100000 * 10 ** 9); // More than user has
+      const minAmountOut = new anchor.BN(900 * 10 ** 9);
+      const vaultDepositAmount = new anchor.BN(950 * 10 ** 9);
+
+      try {
+        await routerProgram.methods
+          .depositSwapStake(
+            swapAmountIn,
+            minAmountOut,
+            vaultDepositAmount,
+            tokenMintA,
+            tokenMintB
+          )
+          .accounts({
+            user: user.publicKey,
+            inputTokenAccount: userTokenAccountA,
+            outputTokenAccount: userTokenAccountB,
+            vaultProgram: vaultProgram.programId,
+          })
+          .signers([user])
+          .rpc();
+        expect.fail("Should have failed with insufficient balance");
+      } catch (e) {
+        expect(e.toString()).to.include("InsufficientBalance");
+      }
+    });
+
+    it("Fails with insufficient accounts", async () => {
+      const swapAmountIn = new anchor.BN(1000 * 10 ** 9);
+      const minAmountOut = new anchor.BN(900 * 10 ** 9);
+      const vaultDepositAmount = new anchor.BN(950 * 10 ** 9);
+
+      // Provide fewer accounts than required
+      const swapAccounts = [
+        { pubkey: pool, isSigner: false, isWritable: false },
+        // Missing other accounts
+      ];
+
+      try {
+        await routerProgram.methods
+          .depositSwapStake(
+            swapAmountIn,
+            minAmountOut,
+            vaultDepositAmount,
+            tokenMintA,
+            tokenMintB
+          )
+          .accounts({
+            user: user.publicKey,
+            inputTokenAccount: userTokenAccountA,
+            outputTokenAccount: userTokenAccountB,
+            vaultProgram: vaultProgram.programId,
+          })
+          .remainingAccounts(swapAccounts)
+          .signers([user])
+          .rpc();
+        expect.fail("Should have failed with insufficient accounts");
+      } catch (e) {
+        expect(
+          e.toString().includes("InsufficientAccounts") ||
+            e.toString().includes("insufficient")
+        ).to.be.true;
+      }
+    });
+  });
+});

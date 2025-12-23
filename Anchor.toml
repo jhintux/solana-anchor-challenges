@@ -1,12 +1,15 @@
 [toolchain]
-package_manager = "yarn"
 anchor_version = "0.32.1"
+package_manager = "yarn"
 
 [features]
 resolution = true
 skip-lint = false
 
 [programs.localnet]
+composer-router-dynamic = "5bw3v7LUaXn3pRmgXUPpeneYu9My3AhF7EemUNmmVLUQ"
+composer-router = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
+mock-amm = "8TN4YaBrKm5WZAcFTxzEBTA1i8AXxwnnYWTFxYF5PsSU"
 sol_challenges = "FCro478qGaVFYHVqU61gAwukUtne3c3BkheKTFR5Zqbm"
 vault-core = "A4nGMAE6j5xty4a5PALzz7nYnWQcB59mYcLptZMoYkfN"
 

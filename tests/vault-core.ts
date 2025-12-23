@@ -829,7 +829,7 @@ describe("vault-core", () => {
     });
   });
 
-  describe.only("rewards", () => {
+  describe("rewards", () => {
     let vault: PublicKey;
     let vaultAuthority: PublicKey;
     let vaultTokenAccount: PublicKey;
