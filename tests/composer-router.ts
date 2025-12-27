@@ -20,7 +20,7 @@ import {
   SendTransactionError,
 } from "@solana/web3.js";
 
-describe.only("composer-router", () => {
+describe("composer-router", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 

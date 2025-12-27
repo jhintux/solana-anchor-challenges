@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::program::invoke;
 use anchor_spl::{token::{Mint, Token, TokenAccount, Transfer}, associated_token::AssociatedToken};
 
 declare_id!("A4nGMAE6j5xty4a5PALzz7nYnWQcB59mYcLptZMoYkfN");
@@ -21,6 +22,11 @@ pub mod vault_core {
         vault.last_update_ts = clock.unix_timestamp;
         vault.reward_mint = ctx.accounts.reward_mint.key();
         vault.reward_vault = ctx.accounts.reward_vault.key();
+        // Initialize flash loan fields
+        vault.flash_fee_bps = 0;
+        vault.fee_treasury = Pubkey::default();
+        vault.callback_allowlist_enabled = false;
+        vault.callback_allowlist = Vec::new();
         Ok(())
     }
 
@@ -351,6 +357,184 @@ pub mod vault_core {
 
         Ok(())
     }
+
+    pub fn update_flash_loan_config(
+        ctx: Context<UpdateFlashLoanConfig>,
+        flash_fee_bps: Option<u16>,
+        fee_treasury: Option<Pubkey>,
+        callback_allowlist_enabled: Option<bool>,
+        callback_allowlist: Option<Vec<Pubkey>>,
+    ) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        
+        // Validate authority
+        require!(
+            vault.authority == ctx.accounts.authority.key(),
+            VaultError::InvalidVault
+        );
+
+        if let Some(fee_bps) = flash_fee_bps {
+            require!(fee_bps <= 10000, VaultError::InvalidAmount); // Max 100% fee
+            vault.flash_fee_bps = fee_bps;
+        }
+
+        if let Some(treasury) = fee_treasury {
+            vault.fee_treasury = treasury;
+        }
+
+        if let Some(enabled) = callback_allowlist_enabled {
+            vault.callback_allowlist_enabled = enabled;
+        }
+
+        if let Some(allowlist) = callback_allowlist {
+            require!(
+                allowlist.len() <= Vault::MAX_CALLBACK_PROGRAMS,
+                VaultError::MathOverflow
+            );
+            vault.callback_allowlist = allowlist;
+        }
+
+        Ok(())
+    }
+
+    pub fn flash_loan(
+        ctx: Context<FlashLoan>,
+        amount: u64,
+        callback_ix_data: Vec<u8>,
+    ) -> Result<()> {
+        require!(amount > 0, VaultError::InvalidFlashLoanAmount);
+
+        let vault = &ctx.accounts.vault;
+        let vault_token_account = &mut ctx.accounts.vault_token_account;
+
+        // Validate flash loan is configured
+        require!(
+            vault.fee_treasury != Pubkey::default(),
+            VaultError::FlashLoanNotConfigured
+        );
+
+        // Validate borrower token account
+        require!(
+            ctx.accounts.borrower_token_account.mint == vault.token_mint,
+            VaultError::InvalidTokenMint
+        );
+        require!(
+            ctx.accounts.borrower_token_account.owner == ctx.accounts.borrower.key(),
+            VaultError::InvalidTokenMint
+        );
+
+        // Validate fee treasury token account
+        require!(
+            ctx.accounts.fee_treasury_token_account.mint == vault.token_mint,
+            VaultError::InvalidFeeTreasury
+        );
+        require!(
+            ctx.accounts.fee_treasury_token_account.owner == vault.fee_treasury,
+            VaultError::InvalidFeeTreasury
+        );
+
+        // Check callback allowlist if enabled
+        if vault.callback_allowlist_enabled {
+            require!(
+                vault.callback_allowlist.contains(&ctx.accounts.callback_program.key()),
+                VaultError::CallbackNotAllowlisted
+            );
+        }
+
+        // Record initial vault balance
+        let balance_before = vault_token_account.amount;
+
+        // Validate sufficient vault balance
+        require!(
+            balance_before >= amount,
+            VaultError::InsufficientVaultBalance
+        );
+
+        // Calculate fee using u128 to prevent overflow
+        let fee = ((amount as u128)
+            .checked_mul(vault.flash_fee_bps as u128)
+            .ok_or(VaultError::MathOverflow)?
+            .checked_div(10000)
+            .ok_or(VaultError::DivisionByZero)?) as u64;
+
+        // Transfer loan amount to borrower
+        let seeds = &[
+            b"vault",
+            vault.token_mint.as_ref(),
+            b"authority",
+            &[ctx.bumps.vault_authority],
+        ];
+        let signer = &[&seeds[..]];
+
+        let cpi_accounts = Transfer {
+            from: vault_token_account.to_account_info(),
+            to: ctx.accounts.borrower_token_account.to_account_info(),
+            authority: ctx.accounts.vault_authority.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        anchor_spl::token::transfer(cpi_ctx, amount)?;
+
+        // CPI to callback program
+        // Build instruction from provided data
+        let callback_ix = anchor_lang::solana_program::instruction::Instruction {
+            program_id: ctx.accounts.callback_program.key(),
+            accounts: ctx.remaining_accounts.iter().map(|acc| {
+                anchor_lang::solana_program::instruction::AccountMeta {
+                    pubkey: acc.key(),
+                    is_signer: acc.is_signer,
+                    is_writable: acc.is_writable,
+                }
+            }).collect(),
+            data: callback_ix_data,
+        };
+
+        // Invoke callback program
+        let callback_account_infos: Vec<_> = ctx.remaining_accounts.iter().map(|acc| (*acc).clone()).collect();
+        invoke(&callback_ix, &callback_account_infos)?;
+
+        // Reload vault token account to get updated balance
+        vault_token_account.reload()?;
+
+        // Record final vault balance
+        let balance_after = vault_token_account.amount;
+
+        // Verify repayment invariant by checking balance delta
+        // After loan transfer, vault should have: balance_before - amount
+        // After callback repayment, vault should have: balance_before - amount + (amount + fee) = balance_before + fee
+        // So: balance_after >= balance_before + fee
+        let required_balance = balance_before
+            .checked_add(fee)
+            .ok_or(VaultError::MathOverflow)?;
+        
+        require!(
+            balance_after >= required_balance,
+            VaultError::InsufficientRepayment
+        );
+
+        // Transfer fee to treasury (from vault)
+        // The fee is already in the vault (as part of repayment), so we transfer it out
+        if fee > 0 {
+            let fee_seeds = &[
+                b"vault",
+                vault.token_mint.as_ref(),
+                b"authority",
+                &[ctx.bumps.vault_authority],
+            ];
+            let fee_signer = &[&fee_seeds[..]];
+
+            let fee_cpi_accounts = Transfer {
+                from: vault_token_account.to_account_info(),
+                to: ctx.accounts.fee_treasury_token_account.to_account_info(),
+                authority: ctx.accounts.vault_authority.to_account_info(),
+            };
+            let fee_cpi_program = ctx.accounts.token_program.to_account_info();
+            let fee_cpi_ctx = CpiContext::new_with_signer(fee_cpi_program, fee_cpi_accounts, fee_signer);
+            anchor_spl::token::transfer(fee_cpi_ctx, fee)?;
+        }
+
+        Ok(())
+    }
 }
 
 // Helper function to calculate shares for deposit
@@ -581,10 +765,28 @@ pub struct Vault {
     pub last_update_ts: i64,
     pub reward_mint: Pubkey,
     pub reward_vault: Pubkey,
+    // Flash loan fields
+    pub flash_fee_bps: u16,
+    pub fee_treasury: Pubkey,
+    pub callback_allowlist_enabled: bool,
+    pub callback_allowlist: Vec<Pubkey>,
 }
 
 impl Vault {
-    pub const LEN: usize = 8 + std::mem::size_of::<Self>();
+    pub const MAX_CALLBACK_PROGRAMS: usize = 10;
+    pub const LEN: usize = 8 + // discriminator
+        32 + // authority
+        32 + // token_mint
+        8 + // total_shares
+        8 + // reward_rate
+        16 + // acc_reward_per_share
+        8 + // last_update_ts
+        32 + // reward_mint
+        32 + // reward_vault
+        2 + // flash_fee_bps
+        32 + // fee_treasury
+        1 + // callback_allowlist_enabled
+        4 + (32 * Self::MAX_CALLBACK_PROGRAMS); // callback_allowlist (Vec<Pubkey> max size)
 }
 
 #[account]
@@ -635,6 +837,48 @@ pub struct ClaimRewards<'info> {
     pub clock: Sysvar<'info, Clock>,
 }
 
+#[derive(Accounts)]
+pub struct UpdateFlashLoanConfig<'info> {
+    #[account(
+        mut,
+        has_one = authority @ VaultError::InvalidVault
+    )]
+    pub vault: Account<'info, Vault>,
+
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct FlashLoan<'info> {
+    #[account(mut)]
+    pub vault: Account<'info, Vault>,
+
+    #[account(mut)]
+    pub vault_token_account: Account<'info, TokenAccount>,
+
+    /// CHECK: PDA authority for the vault token account
+    #[account(
+        seeds = [b"vault", vault.token_mint.as_ref(), b"authority"],
+        bump
+    )]
+    pub vault_authority: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub borrower: Signer<'info>,
+
+    #[account(mut)]
+    pub borrower_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub fee_treasury_token_account: Account<'info, TokenAccount>,
+
+    /// CHECK: Callback program to invoke
+    pub callback_program: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
 #[error_code]
 pub enum VaultError {
     #[msg("Insufficient shares to withdraw")]
@@ -661,4 +905,14 @@ pub enum VaultError {
     RewardVaultMismatch,
     #[msg("Invalid reward mint")]
     InvalidRewardMint,
+    #[msg("Flash loan not configured")]
+    FlashLoanNotConfigured,
+    #[msg("Invalid flash loan amount")]
+    InvalidFlashLoanAmount,
+    #[msg("Callback program not in allowlist")]
+    CallbackNotAllowlisted,
+    #[msg("Insufficient repayment (must repay loan + fee)")]
+    InsufficientRepayment,
+    #[msg("Invalid fee treasury")]
+    InvalidFeeTreasury,
 }
